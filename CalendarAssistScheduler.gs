@@ -1,12 +1,12 @@
 /**
  * ============================================================================
  * FILE: CalendarAssistScheduler.gs
- * Version: 3.0 | Updated: 2026-07-24
+ * Version: 3.1 | Updated: 2026-07-24
  * ----------------------------------------------------------------------------
  * PURPOSE:
- *   Reads a shared "source" Google Calendar for a target week (Sun–Fri), finds
+ *   Reads a shared "read-from" Google Calendar for a target week (Sun–Fri), finds
  *   the work shifts on it, and automatically creates one or more helper events
- *   on a "target" calendar for each shift (e.g. lunch prep, drive to work,
+ *   on a "write-to" calendar for each shift (e.g. lunch prep, drive to work,
  *   drive from work).
  *
  *   WHICH helper events get created is fully data-driven: they are defined in
@@ -15,13 +15,13 @@
  *   follows automatically — you never touch the logic.
  *
  * WHERE THE CALENDAR IDS LIVE — READ THIS:
- *   The source/target calendar IDs and names are NOT stored in this file. They
+ *   The read-from/write-to calendar IDs and names are NOT stored in this file. They
  *   live in Script Properties so the code stays generic and shareable, and no
  *   personal calendar addresses are committed to source. Set them once with
  *   setupCalendarProperties() (or via Project Settings > Script Properties).
  *   Keys used:
- *       SOURCE_CALENDAR_ID    SOURCE_CALENDAR_NAME
- *       TARGET_CALENDAR_ID    TARGET_CALENDAR_NAME
+ *       READ_FROM_CALENDAR_ID    READ_FROM_CALENDAR_NAME
+ *       WRITE_TO_CALENDAR_ID     WRITE_TO_CALENDAR_NAME
  *
  * HOW A BLOCK'S TIMES ARE CALCULATED:
  *   Each block is anchored to either the shift START or the shift END, then
@@ -35,7 +35,7 @@
  *       Drive from work : END   - 45  ..  END   + 30   (anchor END)
  *
  * RECONCILE BEHAVIOR:
- *   Before writing anything, the script reads the target week on the target
+ *   Before writing anything, the script reads the target week on the write-to
  *   calendar and compares any existing managed events (those whose title is one
  *   of the block titles) against the times it just calculated:
  *       - Existing event, correct start AND end   -> LEFT ALONE.
@@ -72,10 +72,10 @@
  * SCRIPT PROPERTY KEYS — where the calendar IDs/names are stored.
  * ==========================================================================*/
 var PROP_KEYS = {
-  SOURCE_CALENDAR_ID: 'SOURCE_CALENDAR_ID',
-  SOURCE_CALENDAR_NAME: 'SOURCE_CALENDAR_NAME',
-  TARGET_CALENDAR_ID: 'TARGET_CALENDAR_ID',
-  TARGET_CALENDAR_NAME: 'TARGET_CALENDAR_NAME'
+  READ_FROM_CALENDAR_ID: 'READ_FROM_CALENDAR_ID',
+  READ_FROM_CALENDAR_NAME: 'READ_FROM_CALENDAR_NAME',
+  WRITE_TO_CALENDAR_ID: 'WRITE_TO_CALENDAR_ID',
+  WRITE_TO_CALENDAR_NAME: 'WRITE_TO_CALENDAR_NAME'
 };
 
 
@@ -99,7 +99,7 @@ var CONFIG = {
 
 
   // --- HOW TO IDENTIFY WORK SHIFTS -----------------------------------------
-  // Only events on the source calendar whose TITLE matches this pattern are
+  // Only events on the read-from calendar whose TITLE matches this pattern are
   // treated as work shifts. Typical shift titles look like "Work duty 1075",
   // "Work 0700-1530", "Instructing", etc. We match the whole word "work"
   // (which also covers "Work duty") OR the word "instructing", case-insensitive.
@@ -237,13 +237,13 @@ function setupCalendarProperties() {
   // ---- FILL THESE IN, RUN ONCE, THEN BLANK THEM OUT -----------------------
   // Calendar to READ shifts FROM. ID preferred (never changes); name is a
   // fallback used only if the ID is empty.
-  values[PROP_KEYS.SOURCE_CALENDAR_ID] = '';   // e.g. 'someone@gmail.com'
-  values[PROP_KEYS.SOURCE_CALENDAR_NAME] = ''; // e.g. 'Shared Shifts'
+  values[PROP_KEYS.READ_FROM_CALENDAR_ID] = '';   // e.g. 'someone@gmail.com'
+  values[PROP_KEYS.READ_FROM_CALENDAR_NAME] = ''; // e.g. 'Shared Shifts'
 
   // Calendar to WRITE helper events TO. Leave BOTH empty to use your
   // primary/default calendar (recommended).
-  values[PROP_KEYS.TARGET_CALENDAR_ID] = '';
-  values[PROP_KEYS.TARGET_CALENDAR_NAME] = '';
+  values[PROP_KEYS.WRITE_TO_CALENDAR_ID] = '';
+  values[PROP_KEYS.WRITE_TO_CALENDAR_NAME] = '';
   // -------------------------------------------------------------------------
 
   var props = PropertiesService.getScriptProperties();
@@ -275,7 +275,7 @@ function listCalendarProperties() {
 
 /**
  * Deletes all four calendar properties. The main script will then fall back to
- * the primary/default calendar for the target and fail to resolve the source.
+ * the primary/default calendar for the write-to and fail to resolve the read-from.
  */
 function clearCalendarProperties() {
   var props = PropertiesService.getScriptProperties();
@@ -301,7 +301,7 @@ function getProp_(key) {
  * DIAGNOSTIC — RUN THIS IF THE SCRIPT CAN'T FIND A CALENDAR.
  * Logs the NAME and ID of every calendar your account can see. Open
  * View > Logs (or the Executions panel) after running to read the list,
- * then copy the desired calendar ID into the SOURCE_CALENDAR_ID property.
+ * then copy the desired calendar ID into the READ_FROM_CALENDAR_ID property.
  */
 function listAllMyCalendars() {
   log_('=== listAllMyCalendars STARTED ===');
@@ -314,7 +314,7 @@ function listAllMyCalendars() {
     log_('        ID  : ' + c.getId());
     log_('        (owned by you? ' + c.isOwnedByMe() + ')');
   }
-  log_('=== DONE. Copy the desired ID into the SOURCE_CALENDAR_ID property. ===');
+  log_('=== DONE. Copy the desired ID into the READ_FROM_CALENDAR_ID property. ===');
 }
 
 
@@ -350,30 +350,30 @@ function createAssistEvents(weekOffset) {
     return;
   }
 
-  // ---- 1) Resolve the SOURCE calendar (the shifts to read) ----------------
+  // ---- 1) Resolve the READ-FROM calendar (the shifts to read) -------------
   // Tries ID first, then name. Does NOT fall back to your default calendar
   // (we must not accidentally read your own calendar as the shift source).
-  var sourceCalendar = resolveCalendar_(getProp_(PROP_KEYS.SOURCE_CALENDAR_ID),
-                                        getProp_(PROP_KEYS.SOURCE_CALENDAR_NAME),
-                                        false, 'SOURCE');
-  if (!sourceCalendar) {
-    log_('ERROR: Could not resolve the SOURCE calendar.');
-    log_('       Run listAllMyCalendars, copy the source calendar ID, and store it');
-    log_('       in the SOURCE_CALENDAR_ID property (setupCalendarProperties).');
+  var readFromCalendar = resolveCalendar_(getProp_(PROP_KEYS.READ_FROM_CALENDAR_ID),
+                                        getProp_(PROP_KEYS.READ_FROM_CALENDAR_NAME),
+                                        false, 'READ_FROM');
+  if (!readFromCalendar) {
+    log_('ERROR: Could not resolve the READ-FROM calendar.');
+    log_('       Run listAllMyCalendars, copy the read-from calendar ID, and store it');
+    log_('       in the READ_FROM_CALENDAR_ID property (setupCalendarProperties).');
     return;
   }
-  log_('Source calendar: "' + sourceCalendar.getName() + '" (id: ' + sourceCalendar.getId() + ')');
+  log_('Read-from calendar: "' + readFromCalendar.getName() + '" (id: ' + readFromCalendar.getId() + ')');
 
-  // ---- 2) Resolve the TARGET calendar (where we write) --------------------
+  // ---- 2) Resolve the WRITE-TO calendar (where we write) ------------------
   // Tries ID, then name, then falls back to your primary/default calendar.
-  var targetCalendar = resolveCalendar_(getProp_(PROP_KEYS.TARGET_CALENDAR_ID),
-                                        getProp_(PROP_KEYS.TARGET_CALENDAR_NAME),
-                                        true, 'TARGET');
-  if (!targetCalendar) {
-    log_('ERROR: Could not resolve the TARGET calendar.');
+  var writeToCalendar = resolveCalendar_(getProp_(PROP_KEYS.WRITE_TO_CALENDAR_ID),
+                                        getProp_(PROP_KEYS.WRITE_TO_CALENDAR_NAME),
+                                        true, 'WRITE_TO');
+  if (!writeToCalendar) {
+    log_('ERROR: Could not resolve the WRITE-TO calendar.');
     return;
   }
-  log_('Target calendar: "' + targetCalendar.getName() + '" (id: ' + targetCalendar.getId() + ')');
+  log_('Write-to calendar: "' + writeToCalendar.getName() + '" (id: ' + writeToCalendar.getId() + ')');
 
   // ---- 3) Work out the date window (target Sunday .. Friday) --------------
   var weekStart = getTargetSunday_(offset); // Sunday 00:00 local
@@ -381,9 +381,9 @@ function createAssistEvents(weekOffset) {
   log_('Processing window: ' + weekStart + '  ->  ' + weekEnd
        + '  (weekOffset=' + offset + ', NUM_DAYS=' + CONFIG.NUM_DAYS + ')');
 
-  // ---- 4) Pull the source events in that window ---------------------------
-  var allEvents = sourceCalendar.getEvents(weekStart, weekEnd);
-  log_('Source calendar returned ' + allEvents.length + ' event(s) in the window.');
+  // ---- 4) Pull the read-from events in that window ------------------------
+  var allEvents = readFromCalendar.getEvents(weekStart, weekEnd);
+  log_('Read-from calendar returned ' + allEvents.length + ' event(s) in the window.');
 
   // ---- 5) Keep only the ones that look like work shifts -------------------
   var shifts = [];
@@ -409,8 +409,8 @@ function createAssistEvents(weekOffset) {
   log_('Calculated ' + desired.length + ' helper event(s) for this week ('
        + CONFIG.BLOCKS.length + ' block(s) x ' + shifts.length + ' shift(s)).');
 
-  // ---- 7) Read what is ALREADY on the target calendar --------------------
-  var existing = findAssistEvents_(targetCalendar, weekStart, weekEnd);
+  // ---- 7) Read what is ALREADY on the write-to calendar ------------------
+  var existing = findAssistEvents_(writeToCalendar, weekStart, weekEnd);
   log_('Found ' + existing.length + ' existing helper event(s) in the window.');
 
   // ---- 8) Compare the two lists ------------------------------------------
@@ -431,7 +431,7 @@ function createAssistEvents(weekOffset) {
       return;
     }
     log_('No conflicts. Creating the ' + plan.missing.length + ' missing event(s).');
-    var addedOnly = createDesiredEvents_(targetCalendar, plan.missing);
+    var addedOnly = createDesiredEvents_(writeToCalendar, plan.missing);
     log_('=== DONE. Created ' + addedOnly + ' event(s). Deleted 0. ===');
     return;
   }
@@ -447,7 +447,7 @@ function createAssistEvents(weekOffset) {
 
   if (answer === 'skip') {
     // Unattended policy only: leave the wrong events but fill in the gaps.
-    var addedOnlyMissing = createDesiredEvents_(targetCalendar, plan.missing);
+    var addedOnlyMissing = createDesiredEvents_(writeToCalendar, plan.missing);
     log_('=== DONE (skip mode). Created ' + addedOnlyMissing + ' missing event(s). '
          + plan.wrong.length + ' wrong-time and ' + plan.orphans.length
          + ' orphaned event(s) were LEFT IN PLACE. ===');
@@ -465,7 +465,7 @@ function createAssistEvents(weekOffset) {
   var toCreate = plan.missing.slice();
   for (var w2 = 0; w2 < plan.wrong.length; w2++) { toCreate.push(plan.wrong[w2].desired); }
 
-  var created = createDesiredEvents_(targetCalendar, toCreate);
+  var created = createDesiredEvents_(writeToCalendar, toCreate);
 
   log_('=== DONE. Deleted ' + deleted + ' event(s), created ' + created + ' event(s), '
        + 'left ' + plan.correct.length + ' correct event(s) untouched. ===');
@@ -907,7 +907,7 @@ function deleteEvents_(events) {
  * @param {string}  name              Calendar name (fallback). May be '' or null.
  * @param {boolean} useDefaultIfEmpty If true and neither id nor name resolves,
  *                                    return the primary/default calendar.
- * @param {string}  label             A short label ('SOURCE'/'TARGET') for logs.
+ * @param {string}  label             A short label ('READ_FROM'/'WRITE_TO') for logs.
  * @return {Calendar|null} The resolved calendar, or null if nothing matched.
  */
 function resolveCalendar_(id, name, useDefaultIfEmpty, label) {
@@ -945,7 +945,7 @@ function resolveCalendar_(id, name, useDefaultIfEmpty, label) {
  * Creates a single event on the given calendar from a desired-event object,
  * honoring its per-block color and reminder plus CONFIG duplicate protection.
  *
- * @param {Calendar} calendar The target CalendarApp calendar object.
+ * @param {Calendar} calendar The write-to CalendarApp calendar object.
  * @param {Object}   desired  {title, start, end, color, popupReminderMin}.
  * @return {boolean} true if an event was created, false if skipped.
  */
@@ -1034,12 +1034,12 @@ function deleteAssistEventsInTargetWeek(weekOffset) {
              : CONFIG.WEEK_OFFSET;
   log_('=== deleteAssistEventsInTargetWeek STARTED (weekOffset=' + offset + ') ===');
 
-  // Resolve the same target calendar the creator writes to.
-  var targetCalendar = resolveCalendar_(getProp_(PROP_KEYS.TARGET_CALENDAR_ID),
-                                        getProp_(PROP_KEYS.TARGET_CALENDAR_NAME),
-                                        true, 'TARGET');
-  if (!targetCalendar) {
-    log_('ERROR: Could not resolve the TARGET calendar.');
+  // Resolve the same write-to calendar the creator writes to.
+  var writeToCalendar = resolveCalendar_(getProp_(PROP_KEYS.WRITE_TO_CALENDAR_ID),
+                                        getProp_(PROP_KEYS.WRITE_TO_CALENDAR_NAME),
+                                        true, 'WRITE_TO');
+  if (!writeToCalendar) {
+    log_('ERROR: Could not resolve the WRITE-TO calendar.');
     return;
   }
 
@@ -1048,7 +1048,7 @@ function deleteAssistEventsInTargetWeek(weekOffset) {
   log_('Delete window: ' + weekStart + '  ->  ' + weekEnd);
 
   var titlesToDelete = getManagedTitles_();
-  var events = targetCalendar.getEvents(weekStart, weekEnd);
+  var events = writeToCalendar.getEvents(weekStart, weekEnd);
   var deleted = 0;
 
   for (var i = 0; i < events.length; i++) {
