@@ -1,0 +1,9 @@
+# clasp
+.clasp.json
+.clasprc.json
+
+# node
+node_modules/
+
+# logs
+*.log
