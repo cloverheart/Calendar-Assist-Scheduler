@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * FILE: CalendarAssistScheduler.gs
- * Version: 3.1 | Updated: 2026-07-24
+ * Version: 3.3 | Updated: 2026-08-07
  * ----------------------------------------------------------------------------
  * PURPOSE:
  *   Reads a shared "read-from" Google Calendar for a target week (Sun–Fri), finds
@@ -42,24 +42,20 @@
  *       - Existing event, wrong start or end      -> needs replacing.
  *       - Existing event with no matching shift   -> orphan, needs removing.
  *       - Missing event                           -> will be created.
- *   If anything needs replacing/removing, a YES/NO pop-up lists the differences.
- *       YES -> delete only the wrong/orphan events, then create the correct set.
- *       NO  -> stop. Nothing is created, changed, or deleted.
- *   If the only difference is MISSING events (nothing wrong), no pop-up is
- *   shown — the missing events are simply created.
- *
- * POP-UP LIMITATION — READ THIS:
- *   Google Apps Script can only show a dialog when the script runs from the
- *   editor or from a container-bound Sheet/Doc. A TIME-BASED TRIGGER has no
- *   user interface, so no pop-up can appear. When no UI is available the
- *   script obeys CONFIG.WHEN_NO_UI ('stop' by default = safest: it logs the
- *   conflicts and changes nothing).
+ *   If anything needs replacing/removing, the differences are logged and then
+ *   fixed automatically: the wrong/orphan events are deleted and the correct
+ *   set is created. There is no confirmation step — this always runs from the
+ *   Apps Script editor or a time-based trigger, neither of which can show a
+ *   pop-up, so there is no one available to answer one.
  *
  * FUNCTIONS YOU CAN RUN:
  *   setupCalendarProperties       - store the calendar IDs/names (run once).
  *   listCalendarProperties        - print the currently stored calendar props.
  *   clearCalendarProperties       - wipe all four calendar props.
  *   listAllMyCalendars            - print every calendar's name + ID.
+ *   diagnoseReadFromCalendar      - dump the raw read-from events + last-updated
+ *                                   times. Run this when the log shows STALE
+ *                                   shift titles/times.
  *   createAssistEvents            - build the helper events (main entry point).
  *   runForThisWeek/NextWeek/...   - week-specific wrappers (trigger-safe).
  *   installWeeklyTrigger          - auto-run every Friday for a chosen week.
@@ -192,14 +188,6 @@ var CONFIG = {
   // Set false to treat every wrong-timed event as an orphan instead.
   MATCH_BY_SAME_DAY: true,
 
-  // What to do when replacements are needed but NO pop-up is possible
-  // (time-based trigger, or any run without a user interface):
-  //   'stop'    - change nothing, log the conflicts. SAFEST. Default.
-  //   'replace' - assume YES and fix the events unattended.
-  //   'skip'    - leave the wrong events alone but still create missing ones.
-  WHEN_NO_UI: 'stop',
-
-
   // --- LOGGING -------------------------------------------------------------
   // true  = verbose logging (recommended while setting up / troubleshooting).
   // false = quieter logs.
@@ -315,6 +303,101 @@ function listAllMyCalendars() {
     log_('        (owned by you? ' + c.isOwnedByMe() + ')');
   }
   log_('=== DONE. Copy the desired ID into the READ_FROM_CALENDAR_ID property. ===');
+}
+
+
+/**
+ * DIAGNOSTIC — RUN THIS WHEN THE SCRIPT REPORTS STALE TITLES/TIMES.
+ *
+ * Symptom this is for: the shifts on the shared calendar were renamed and/or
+ * re-timed, but the execution log still shows the OLD titles and OLD times.
+ * That means the script is reading a stale COPY of the calendar, not that the
+ * block math is wrong. This function prints the evidence needed to tell which
+ * copy it is reading:
+ *
+ *   1) How many calendars match the stored READ_FROM name. If more than one,
+ *      resolveCalendar_ silently takes the first — which may be an old
+ *      duplicate/copy of the shared calendar.
+ *   2) The ID actually resolved, so it can be compared against the ID of the
+ *      live shared calendar in listAllMyCalendars.
+ *   3) Every raw event in the window with its title, start, end, event ID, and
+ *      getLastUpdated() timestamp.
+ *
+ * HOW TO READ THE RESULT:
+ *   - LAST UPDATED is older than when the shifts were edited  -> the calendar
+ *     being read is a stale copy. Most common cause: it is an "Other calendars
+ *     > From URL" ICS subscription, which Google re-syncs on its own slow
+ *     schedule (often many hours, sometimes stuck). Fix by subscribing to the
+ *     real shared calendar (Add calendar > Subscribe to calendar) and storing
+ *     THAT calendar's ID in READ_FROM_CALENDAR_ID.
+ *   - More than one calendar matched the NAME -> name lookup is ambiguous.
+ *     Store the correct READ_FROM_CALENDAR_ID so the name is never consulted.
+ *   - Titles/times are CURRENT here but shifts were skipped -> the titles no
+ *     longer match CONFIG.SHIFT_TITLE_PATTERN; the SHIFT MATCH / SKIP lines
+ *     below say which. Widen the pattern.
+ *
+ * @param {number} [weekOffset] Same meaning as in createAssistEvents.
+ */
+function diagnoseReadFromCalendar(weekOffset) {
+  var offset = (typeof weekOffset === 'number' && isFinite(weekOffset))
+             ? weekOffset
+             : CONFIG.WEEK_OFFSET;
+  log_('=== diagnoseReadFromCalendar STARTED (weekOffset=' + offset + ') ===');
+
+  var storedId = getProp_(PROP_KEYS.READ_FROM_CALENDAR_ID);
+  var storedName = getProp_(PROP_KEYS.READ_FROM_CALENDAR_NAME);
+  log_('READ_FROM_CALENDAR_ID   = ' + (storedId === '' ? '(empty)' : storedId));
+  log_('READ_FROM_CALENDAR_NAME = ' + (storedName === '' ? '(empty)' : storedName));
+
+  // A name that matches several calendars is the classic stale-copy trap.
+  if (storedName !== '') {
+    var matches = CalendarApp.getCalendarsByName(storedName);
+    log_(matches.length + ' calendar(s) match that NAME:');
+    for (var m = 0; m < matches.length; m++) {
+      log_('  [' + (m + 1) + '] ' + matches[m].getId()
+           + (m === 0 ? '   <-- the one name-lookup would pick' : ''));
+    }
+    if (matches.length > 1) {
+      log_('  WARNING: the name is ambiguous. Set READ_FROM_CALENDAR_ID to the');
+      log_('           correct ID above so the name is never used.');
+    }
+  }
+
+  var cal = resolveCalendar_(storedId, storedName, false, 'READ_FROM');
+  if (!cal) {
+    log_('ERROR: Could not resolve the READ-FROM calendar. Run listAllMyCalendars.');
+    return;
+  }
+  log_('RESOLVED calendar: "' + cal.getName() + '"');
+  log_('  id       : ' + cal.getId());
+  log_('  owned by me? ' + cal.isOwnedByMe());
+
+  var weekStart = getTargetSunday_(offset);
+  var weekEnd = addMinutes_(weekStart, CONFIG.NUM_DAYS * 24 * 60);
+  log_('Window: ' + weekStart + '  ->  ' + weekEnd);
+
+  var events = cal.getEvents(weekStart, weekEnd);
+  log_('RAW EVENTS IN WINDOW: ' + events.length);
+
+  for (var i = 0; i < events.length; i++) {
+    var e = events[i];
+    log_('  [' + (i + 1) + '] "' + e.getTitle() + '"');
+    log_('        start: ' + e.getStartTime());
+    log_('        end  : ' + e.getEndTime());
+    log_('        all-day? ' + e.isAllDayEvent()
+         + '   recurring? ' + (e.isRecurringEvent ? e.isRecurringEvent() : 'n/a'));
+    // The decisive field: when Google last saw a change to this event.
+    try {
+      log_('        LAST UPDATED: ' + e.getLastUpdated());
+    } catch (err) {
+      log_('        LAST UPDATED: (unavailable: ' + err + ')');
+    }
+    log_('        event id: ' + e.getId());
+    log_('        matches SHIFT_TITLE_PATTERN? '
+         + CONFIG.SHIFT_TITLE_PATTERN.test(e.getTitle()));
+  }
+
+  log_('=== DONE. Compare LAST UPDATED against when the shifts were edited. ===');
 }
 
 
@@ -436,25 +519,10 @@ function createAssistEvents(weekOffset) {
     return;
   }
 
-  // ---- 10) Conflicts exist -> ask before touching anything ---------------
-  var answer = askToReplace_(plan, weekStart, weekEnd); // 'replace' | 'stop' | 'skip'
+  // ---- 10) Conflicts exist -> log them, then fix automatically -----------
+  logConflicts_(plan, weekStart, weekEnd);
 
-  if (answer === 'stop') {
-    log_('=== STOPPED at user request (or no UI available). No events were created, ');
-    log_('    changed, or deleted. Existing calendar is untouched. ===');
-    return;
-  }
-
-  if (answer === 'skip') {
-    // Unattended policy only: leave the wrong events but fill in the gaps.
-    var addedOnlyMissing = createDesiredEvents_(writeToCalendar, plan.missing);
-    log_('=== DONE (skip mode). Created ' + addedOnlyMissing + ' missing event(s). '
-         + plan.wrong.length + ' wrong-time and ' + plan.orphans.length
-         + ' orphaned event(s) were LEFT IN PLACE. ===');
-    return;
-  }
-
-  // ---- 11) Approved: delete the bad events, then write the correct set ---
+  // ---- 11) Delete the bad events, then write the correct set -------------
   var toDelete = [];
   for (var w = 0; w < plan.wrong.length; w++) { toDelete.push(plan.wrong[w].event); }
   for (var o = 0; o < plan.orphans.length; o++) { toDelete.push(plan.orphans[o]); }
@@ -738,77 +806,24 @@ function reconcile_(desired, existing) {
 
 
 /**
- * Shows the YES/NO pop-up describing exactly what would change.
- *
- * A dialog is only possible when the script runs from the editor or from a
- * container-bound Sheet/Doc. Under a time-based trigger there is no UI at all,
- * so the answer comes from CONFIG.WHEN_NO_UI instead.
+ * Logs exactly what is about to change, then the caller fixes it
+ * automatically. Neither the Apps Script editor nor a time-based trigger can
+ * show a dialog, so this is the only record of what happened, not a prompt.
  *
  * @param {Object} plan       From reconcile_.
  * @param {Date}   weekStart
  * @param {Date}   weekEnd
- * @return {string} 'replace' = fix the calendar, 'stop' = change nothing,
- *                  'skip' = leave wrong events but still create missing ones.
  */
-function askToReplace_(plan, weekStart, weekEnd) {
+function logConflicts_(plan, weekStart, weekEnd) {
   var message = buildConflictMessage_(plan, weekStart, weekEnd);
-
-  // Always log the same detail the dialog would show, so an unattended run
-  // still leaves a readable record of what it saw.
-  log_('---- CONFLICTS FOUND ----');
+  log_('---- CONFLICTS FOUND (fixing automatically) ----');
   log_(message);
-  log_('-------------------------');
-
-  var ui = getUiOrNull_();
-
-  if (ui) {
-    var response = ui.alert('Replace existing assist events?', message, ui.ButtonSet.YES_NO);
-    var saidYes = (response === ui.Button.YES);
-    log_('User answered: ' + (saidYes ? 'YES (replace)' : 'NO (stop)'));
-    return saidYes ? 'replace' : 'stop';
-  }
-
-  // ---- No UI available: fall back to the configured policy ---------------
-  log_('No user interface available (time-based trigger or non-bound script).');
-  log_('Falling back to CONFIG.WHEN_NO_UI = "' + CONFIG.WHEN_NO_UI + '".');
-
-  if (CONFIG.WHEN_NO_UI === 'replace') {
-    log_('  -> Proceeding with the replacement unattended.');
-    return 'replace';
-  }
-  if (CONFIG.WHEN_NO_UI === 'skip') {
-    log_('  -> Leaving the wrong events alone; creating only the missing ones.');
-    return 'skip';
-  }
-  log_('  -> Stopping. Nothing changed.');
-  return 'stop';
+  log_('-------------------------------------------------');
 }
 
 
 /**
- * Returns a Ui object if one is reachable, otherwise null. Standalone scripts
- * and trigger-driven runs throw here, which is expected and not an error.
- *
- * @return {Ui|null}
- */
-function getUiOrNull_() {
-  // A container-bound Sheet gives the most reliable dialog.
-  try {
-    var sheet = SpreadsheetApp.getActiveSpreadsheet();
-    if (sheet) { return SpreadsheetApp.getUi(); }
-  } catch (e) { /* not bound to a Sheet */ }
-
-  try {
-    var doc = DocumentApp.getActiveDocument();
-    if (doc) { return DocumentApp.getUi(); }
-  } catch (e2) { /* not bound to a Doc */ }
-
-  return null;
-}
-
-
-/**
- * Builds the human-readable body of the confirmation dialog.
+ * Builds the human-readable log entry describing what will change.
  *
  * @param {Object} plan
  * @param {Date}   weekStart
@@ -854,7 +869,7 @@ function buildConflictMessage_(plan, weekStart, weekEnd) {
     lines.push('');
   }
 
-  lines.push('Replace them?  YES = fix the calendar.  NO = stop, change nothing.');
+  lines.push('Fixing the calendar to match automatically.');
   return lines.join('\n');
 }
 
