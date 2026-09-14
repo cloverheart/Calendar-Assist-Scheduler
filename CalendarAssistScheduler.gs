@@ -553,7 +553,7 @@ function createAssistEvents(weekOffset) {
  * ==========================================================================*/
 
 /** Generic: process the week `n` weeks from now (0 = this week). */
-function runForWeek(n) {
+function runForWeek(n=0) {
   // Coerce so a stray string ("2") still works when called from code; a
   // trigger event object becomes NaN here and the main function then falls
   // back to CONFIG.WEEK_OFFSET, which is the safe default.
