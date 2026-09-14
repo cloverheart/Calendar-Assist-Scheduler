@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * FILE: CalendarAssistScheduler.gs
- * Version: 3.3 | Updated: 2026-08-07
+ * Version: 3.4 | Updated: 2026-09-14
  * ----------------------------------------------------------------------------
  * PURPOSE:
  *   Reads a shared "read-from" Google Calendar for a target week (Sun–Fri), finds
@@ -35,9 +35,11 @@
  *       Drive from work : END   - 45  ..  END   + 30   (anchor END)
  *
  * RECONCILE BEHAVIOR:
- *   Before writing anything, the script reads the target week on the write-to
- *   calendar and compares any existing managed events (those whose title is one
- *   of the block titles) against the times it just calculated:
+ *   Before writing anything, the script reads the write-to calendar over the
+ *   target week PLUS a padding margin (wide enough to cover the biggest block
+ *   offset, e.g. a block that starts 75 minutes before an early-Sunday shift
+ *   lands on Saturday) and compares any existing managed events (those whose
+ *   title is one of the block titles) against the times it just calculated:
  *       - Existing event, correct start AND end   -> LEFT ALONE.
  *       - Existing event, wrong start or end      -> needs replacing.
  *       - Existing event with no matching shift   -> orphan, needs removing.
@@ -339,9 +341,7 @@ function listAllMyCalendars() {
  * @param {number} [weekOffset] Same meaning as in createAssistEvents.
  */
 function diagnoseReadFromCalendar(weekOffset) {
-  var offset = (typeof weekOffset === 'number' && isFinite(weekOffset))
-             ? weekOffset
-             : CONFIG.WEEK_OFFSET;
+  var offset = resolveWeekOffset_(weekOffset);
   log_('=== diagnoseReadFromCalendar STARTED (weekOffset=' + offset + ') ===');
 
   var storedId = getProp_(PROP_KEYS.READ_FROM_CALENDAR_ID);
@@ -372,11 +372,10 @@ function diagnoseReadFromCalendar(weekOffset) {
   log_('  id       : ' + cal.getId());
   log_('  owned by me? ' + cal.isOwnedByMe());
 
-  var weekStart = getTargetSunday_(offset);
-  var weekEnd = addMinutes_(weekStart, CONFIG.NUM_DAYS * 24 * 60);
-  log_('Window: ' + weekStart + '  ->  ' + weekEnd);
+  var window = getWeekWindow_(offset);
+  log_('Window: ' + window.start + '  ->  ' + window.end);
 
-  var events = cal.getEvents(weekStart, weekEnd);
+  var events = cal.getEvents(window.start, window.end);
   log_('RAW EVENTS IN WINDOW: ' + events.length);
 
   for (var i = 0; i < events.length; i++) {
@@ -420,10 +419,7 @@ function diagnoseReadFromCalendar(weekOffset) {
  *   runForWeek(n) from your own code.
  */
 function createAssistEvents(weekOffset) {
-  // Trust the argument only if it is a genuine finite number (see note above).
-  var offset = (typeof weekOffset === 'number' && isFinite(weekOffset))
-             ? weekOffset
-             : CONFIG.WEEK_OFFSET;
+  var offset = resolveWeekOffset_(weekOffset);
 
   log_('=== createAssistEvents STARTED (weekOffset=' + offset + ') ===');
 
@@ -459,10 +455,13 @@ function createAssistEvents(weekOffset) {
   log_('Write-to calendar: "' + writeToCalendar.getName() + '" (id: ' + writeToCalendar.getId() + ')');
 
   // ---- 3) Work out the date window (target Sunday .. Friday) --------------
-  var weekStart = getTargetSunday_(offset); // Sunday 00:00 local
-  var weekEnd = addMinutes_(weekStart, CONFIG.NUM_DAYS * 24 * 60); // exclusive end
+  var window = getWeekWindow_(offset); // {start, end, scanStart, scanEnd}
+  var weekStart = window.start; // Sunday 00:00 local
+  var weekEnd = window.end; // exclusive end
   log_('Processing window: ' + weekStart + '  ->  ' + weekEnd
        + '  (weekOffset=' + offset + ', NUM_DAYS=' + CONFIG.NUM_DAYS + ')');
+  log_('Reconcile scan window (padded for out-of-week block offsets): '
+       + window.scanStart + '  ->  ' + window.scanEnd);
 
   // ---- 4) Pull the read-from events in that window ------------------------
   var allEvents = readFromCalendar.getEvents(weekStart, weekEnd);
@@ -492,9 +491,14 @@ function createAssistEvents(weekOffset) {
   log_('Calculated ' + desired.length + ' helper event(s) for this week ('
        + CONFIG.BLOCKS.length + ' block(s) x ' + shifts.length + ' shift(s)).');
 
-  // ---- 7) Read what is ALREADY on the write-to calendar ------------------
-  var existing = findAssistEvents_(writeToCalendar, weekStart, weekEnd);
-  log_('Found ' + existing.length + ' existing helper event(s) in the window.');
+  // ---- 7) Read what is ALREADY on the write-to calendar -------------------
+  // Scanned over the padded window (see getWeekWindow_), not just weekStart..
+  // weekEnd: a block anchored far enough from its shift's START/END can land
+  // outside the shift week (e.g. "Prep lunch" 75 min before an early-Sunday
+  // shift falls on Saturday). Scanning only the shift week would report that
+  // existing event as "missing" forever and could never mark it an orphan.
+  var existing = findAssistEvents_(writeToCalendar, window.scanStart, window.scanEnd);
+  log_('Found ' + existing.length + ' existing helper event(s) in the scan window.');
 
   // ---- 8) Compare the two lists ------------------------------------------
   var plan = reconcile_(desired, existing);
@@ -616,6 +620,24 @@ function validateBlocks_(blocks) {
       log_('  ' + where + ' ("' + b.title + '") problem: endOffsetMin ('
            + b.endOffsetMin + ') must be greater than startOffsetMin ('
            + b.startOffsetMin + ').'); ok = false;
+    }
+
+    // Catch a bad color/reminder here, before any events are written — left
+    // unchecked, a typo'd color only surfaces as a per-event WARNING at
+    // creation time (after some events already exist), and a non-numeric
+    // popupReminderMin throws inside addPopupReminder_, silently dropping
+    // just that one event's reminder.
+    if (b.hasOwnProperty('color') && b.color !== undefined
+        && typeof b.color === 'string' && b.color.trim() !== ''
+        && !CalendarApp.EventColor[b.color]) {
+      log_('  ' + where + ' ("' + b.title + '") problem: color "' + b.color
+           + '" is not a valid EventColor name.'); ok = false;
+    }
+    if (b.hasOwnProperty('popupReminderMin') && b.popupReminderMin !== null
+        && typeof b.popupReminderMin !== 'number') {
+      log_('  ' + where + ' ("' + b.title + '") problem: popupReminderMin must '
+           + 'be a number or null, got ' + JSON.stringify(b.popupReminderMin)
+           + '.'); ok = false;
     }
   }
   return ok;
@@ -1044,9 +1066,7 @@ function eventExists_(calendar, title, startTime) {
  *                 (e.g. a trigger event object) falls back to CONFIG.WEEK_OFFSET.
  */
 function deleteAssistEventsInTargetWeek(weekOffset) {
-  var offset = (typeof weekOffset === 'number' && isFinite(weekOffset))
-             ? weekOffset
-             : CONFIG.WEEK_OFFSET;
+  var offset = resolveWeekOffset_(weekOffset);
   log_('=== deleteAssistEventsInTargetWeek STARTED (weekOffset=' + offset + ') ===');
 
   // Resolve the same write-to calendar the creator writes to.
@@ -1058,22 +1078,13 @@ function deleteAssistEventsInTargetWeek(weekOffset) {
     return;
   }
 
-  var weekStart = getTargetSunday_(offset);
-  var weekEnd = addMinutes_(weekStart, CONFIG.NUM_DAYS * 24 * 60);
-  log_('Delete window: ' + weekStart + '  ->  ' + weekEnd);
+  // Padded scan window, same reasoning as createAssistEvents: a block anchored
+  // far enough from its shift's START/END can land just outside the shift week.
+  var window = getWeekWindow_(offset);
+  log_('Delete window: ' + window.scanStart + '  ->  ' + window.scanEnd);
 
-  var titlesToDelete = getManagedTitles_();
-  var events = writeToCalendar.getEvents(weekStart, weekEnd);
-  var deleted = 0;
-
-  for (var i = 0; i < events.length; i++) {
-    var e = events[i];
-    if (titlesToDelete.indexOf(e.getTitle()) !== -1) {
-      log_('  DELETING: "' + e.getTitle() + '"  ' + e.getStartTime());
-      e.deleteEvent();
-      deleted++;
-    }
-  }
+  var toDelete = findAssistEvents_(writeToCalendar, window.scanStart, window.scanEnd);
+  var deleted = deleteEvents_(toDelete);
   log_('=== DONE. Deleted ' + deleted + ' event(s). ===');
 }
 
@@ -1165,6 +1176,85 @@ function getTargetSunday_(offsetWeeks) {
  */
 function addMinutes_(date, minutes) {
   return new Date(date.getTime() + minutes * 60 * 1000);
+}
+
+/**
+ * Returns a NEW Date offset from the given date by whole calendar DAYS, at
+ * local midnight. Unlike addMinutes_, this is DST-safe: it never counts a
+ * fixed number of minutes across a spring-forward/fall-back boundary, so
+ * "6 days from Sunday midnight" always lands on Saturday midnight, even on
+ * the week the clocks change (a fixed-minutes offset would land at 23:00 the
+ * day before or 01:00 the day after).
+ *
+ * @param {Date}   date  Any Date; only the calendar date is used.
+ * @param {number} days  May be negative.
+ * @return {Date} Midnight local time, `days` calendar days later.
+ */
+function addDays_(date, days) {
+  var d = new Date(date.getFullYear(), date.getMonth(), date.getDate() + days);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+/**
+ * Resolves the week offset a zero-argument entry point should use.
+ *
+ * Google Apps Script cannot pass an argument when a function is (a) picked
+ * from the editor's Run menu or (b) fired by a time-based trigger — in the
+ * trigger case GAS actually passes an EVENT OBJECT as the first argument, not
+ * a number. So the argument is trusted only when it is a genuine finite
+ * number; anything else (including a trigger event object) falls back to
+ * CONFIG.WEEK_OFFSET.
+ *
+ * @param {*} weekOffset Whatever was passed in, if anything.
+ * @return {number}
+ */
+function resolveWeekOffset_(weekOffset) {
+  return (typeof weekOffset === 'number' && isFinite(weekOffset))
+       ? weekOffset
+       : CONFIG.WEEK_OFFSET;
+}
+
+/**
+ * The largest absolute block offset across CONFIG.BLOCKS, in minutes. Used to
+ * size the reconcile scan-window padding: a block anchored this far from a
+ * shift's START/END can land outside the Sun-Fri processing window, so the
+ * write-to calendar has to be scanned wider than the shifts are read.
+ *
+ * @return {number} Always >= 0.
+ */
+function maxBlockOffsetMin_() {
+  var max = 0;
+  for (var i = 0; i < CONFIG.BLOCKS.length; i++) {
+    var b = CONFIG.BLOCKS[i];
+    max = Math.max(max, Math.abs(b.startOffsetMin), Math.abs(b.endOffsetMin));
+  }
+  return max;
+}
+
+/**
+ * Computes the target week's processing window plus a padded scan window for
+ * reconcile. The processing window (start/end) is exactly the shifts to read
+ * (Sunday .. Sunday+NUM_DAYS, calendar days). The scan window (scanStart/
+ * scanEnd) is padded by enough whole days to cover the biggest block offset,
+ * so helper events that land just outside the shift week (e.g. a "Prep lunch"
+ * block 75 minutes before an early-Sunday shift, which falls on Saturday)
+ * are still found by findAssistEvents_ and correctly reconciled instead of
+ * being reported as perpetually missing.
+ *
+ * @param {number} offsetWeeks Same meaning as CONFIG.WEEK_OFFSET.
+ * @return {{start:Date, end:Date, scanStart:Date, scanEnd:Date}}
+ */
+function getWeekWindow_(offsetWeeks) {
+  var start = getTargetSunday_(offsetWeeks);
+  var end = addDays_(start, CONFIG.NUM_DAYS);
+  var padDays = Math.ceil(maxBlockOffsetMin_() / (24 * 60));
+  return {
+    start: start,
+    end: end,
+    scanStart: addDays_(start, -padDays),
+    scanEnd: addDays_(end, padDays)
+  };
 }
 
 /**
