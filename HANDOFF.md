@@ -1,5 +1,38 @@
 # Handoff
 
+## v3.5 (2026-09-25) — Eve "Mining" mirror
+
+Added `syncEveMiningEvents` / `installEveMiningTrigger` (+ `fetchEveMiningItems_`,
+`indexEveMirrors_`, `createEveMirror_`, `esiGetEventDetail_`, ESI helpers `esi*`,
+`CONFIG.EVE_MINING`, `ESI_PROP_KEYS`). The in-game Eve calendar has no Google feed, so it is read
+from Eve ESI (`esi-calendar.read_calendar_events.v1`) with a refresh token in Script Properties
+(`ESI_CLIENT_ID`, `ESI_CLIENT_SECRET`, `ESI_REFRESH_TOKEN`, `ESI_MIRRORED_IDS`; kept out of
+`PROP_KEYS` so `clearCalendarProperties` can't wipe them). Items with "Mining" in the title and
+owner_type in `CONFIG.EVE_MINING.OWNER_TYPES` (default corporation) become timed events on the
+write-to calendar (`Eve: <title>`, start = in-game date, end = start + ESI duration). A Google Task
+was requested but Tasks store only a date, so a timed calendar event is used.
+
+Sync behaviour (after review fixes): mirrors are found by an `EVE_SRC:<event_id>` FIRST description
+line. New item -> created. Re-timed in-game item -> its mirror is re-timed (no duplicate). Mirror
+deleted by hand -> NOT recreated (id kept in `ESI_MIRRORED_IDS`; delete that property to reset).
+Item gone from the in-game list -> its future mirror is deleted, only when the ESI read was
+complete (not cut by `MAX_PAGES`); started/past mirrors are never deleted. Auth failure THROWS so
+the trigger run shows as failed — turn on failure notifications for the trigger or it fails
+unseen. Item detail is cached 6 h per event id (re-fetched if date/title change), so a body/
+duration-only edit can take up to 6 h to show. Poll is hourly (ESI has no push). A 401 clears the
+cached access token.
+
+Do not assume ESI list order: pages are read up to `MAX_PAGES` and out-of-window items skipped
+individually (early stop was removed on purpose).
+
+Verified live (2026-09-25): the ORIGINAL v3.5 build read 4 corp Mining items from ESI and created
+4 mirrors on the primary calendar (owner_type "corporation" accepted, times correct).
+NOT verified: everything added after that review — re-time/update path, gone-item deletion,
+hand-delete suppression, detail cache, 401/429 retry, the throw-on-auth-failure path, the hourly
+trigger (`installEveMiningTrigger` not confirmed run), refresh-token rotation. No test suite
+exists; only `node --check` syntax was run. The Eve `code` / client secret are blank in the repo
+and were re-pushed blank; keep the editor copy blank.
+
 ## Current state (2026-09-14)
 
 `CalendarAssistScheduler.gs` is at **v3.4**, pushed to the live Apps Script project via
@@ -56,5 +89,7 @@ then fixed two real bugs and cleaned up duplication:
 
 ## Not yet done
 
-Nothing outstanding from this change. Next stale-calendar report should be diagnosed with
+v3.5: live-verify the Eve mirror paths listed under "NOT verified" above (run `syncEveMiningEvents`
+twice; expect `unchanged N` on the second), then run `installEveMiningTrigger`. Otherwise nothing
+outstanding. Next stale-calendar report should be diagnosed with
 `diagnoseReadFromCalendar()` before assuming the block math is wrong.

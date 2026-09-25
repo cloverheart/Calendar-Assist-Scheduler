@@ -1,7 +1,11 @@
 /**
  * ============================================================================
  * FILE: CalendarAssistScheduler.gs
- * Version: 3.4 | Updated: 2026-09-14
+ * Version: 3.5 | Updated: 2026-09-25
+ *   v3.5: adds the Eve "Mining" mirror. Deviations from the request: a timed
+ *   calendar event instead of a Google Task (Tasks drop the time), read via Eve
+ *   ESI polled hourly instead of a Google calendar-updated trigger (the in-game
+ *   calendar has no Google feed).
  * ----------------------------------------------------------------------------
  * PURPOSE:
  *   Reads a shared "read-from" Google Calendar for a target week (Sun–Fri), finds
@@ -62,6 +66,29 @@
  *   runForThisWeek/NextWeek/...   - week-specific wrappers (trigger-safe).
  *   installWeeklyTrigger          - auto-run every Friday for a chosen week.
  *   deleteAssistEventsInTargetWeek- remove events THIS script made (clean redo).
+ *   esiSetupProperties            - store Eve ESI client id/secret (run once).
+ *   esiLogAuthUrl                 - print the Eve SSO login URL (one-time auth).
+ *   esiStoreAuthCode              - swap the pasted auth code for a refresh token.
+ *   syncEveMiningEvents           - mirror upcoming Eve in-game calendar items whose
+ *                                   title contains "Mining" onto the write-to calendar
+ *                                   as timed events (same start/end as in game).
+ *   installEveMiningTrigger       - run syncEveMiningEvents on an hourly poll.
+ *
+ * EVE MINING MIRROR (v3.5):
+ *   The in-game calendar has no Google feed, so the script reads it from Eve's ESI
+ *   API (scope esi-calendar.read_calendar_events.v1) using a refresh token stored in
+ *   Script Properties ESI_CLIENT_ID / ESI_CLIENT_SECRET / ESI_REFRESH_TOKEN.
+ *   Google Tasks only store a due DATE (time is dropped), so instead of a Task the
+ *   script creates a timed calendar event at the in-game time. Each mirror carries
+ *   a "EVE_SRC:<eve event id>" marker in its description so re-runs never
+ *   duplicate. A re-timed in-game item re-times its mirror; an item that
+ *   disappears from the in-game list has its future mirror deleted; a mirror you
+ *   delete by hand is NOT recreated (ids remembered in ESI_MIRRORED_IDS).
+ *   ESI has no push, so detection is an hourly poll, not a calendar trigger. If
+ *   ESI auth fails the run throws, so enable failure notifications on the trigger
+ *   (Apps Script > Triggers > Failure notification settings).
+ *   Mirror titles are prefixed (CONFIG.EVE_MINING.EVENT_TITLE_PREFIX) so they can
+ *   never collide with CONFIG.BLOCKS titles that reconcile manages/deletes.
  * ============================================================================
  */
 
@@ -74,6 +101,17 @@ var PROP_KEYS = {
   READ_FROM_CALENDAR_NAME: 'READ_FROM_CALENDAR_NAME',
   WRITE_TO_CALENDAR_ID: 'WRITE_TO_CALENDAR_ID',
   WRITE_TO_CALENDAR_NAME: 'WRITE_TO_CALENDAR_NAME'
+};
+
+// Eve ESI credentials. Kept OUT of PROP_KEYS on purpose so clearCalendarProperties
+// (which loops PROP_KEYS) can never wipe the stored refresh token.
+var ESI_PROP_KEYS = {
+  CLIENT_ID: 'ESI_CLIENT_ID',
+  CLIENT_SECRET: 'ESI_CLIENT_SECRET',
+  REFRESH_TOKEN: 'ESI_REFRESH_TOKEN',
+  // JSON array of Eve event ids already mirrored (so a hand-deleted mirror is
+  // not recreated). Written by syncEveMiningEvents; safe to delete to reset.
+  MIRRORED_IDS: 'ESI_MIRRORED_IDS'
 };
 
 
@@ -189,6 +227,37 @@ var CONFIG = {
   // are wrong it becomes a REPLACE candidate rather than a duplicate.
   // Set false to treat every wrong-timed event as an orphan instead.
   MATCH_BY_SAME_DAY: true,
+
+  // --- EVE ONLINE MINING MIRROR --------------------------------------------
+  // In-game Eve calendar items (read via ESI) whose title matches TITLE_PATTERN
+  // are copied onto the write-to calendar at the same start/end (see
+  // syncEveMiningEvents).
+  EVE_MINING: {
+    TITLE_PATTERN: /\bmining\b/i,
+    // ESI owner_type values to accept. 'corporation' = corp calendar items only.
+    // Add 'alliance', 'character', etc. to widen. Rejected types are logged.
+    OWNER_TYPES: ['corporation'],
+    // Duration (min) used if ESI returns no duration for an item.
+    DEFAULT_DURATION_MIN: 60,
+    // Max ESI list pages (50 events each) fetched per run.
+    MAX_PAGES: 10,
+    // Seconds an item's ESI detail (duration/owner/text) is cached, so the
+    // hourly poll doesn't re-fetch every Mining item. Max 21600 (6 h).
+    DETAIL_CACHE_SEC: 21600,
+    // Prefix on the mirrored event title. MUST NOT make a title equal to any
+    // CONFIG.BLOCKS title (reconcile deletes managed titles).
+    EVENT_TITLE_PREFIX: 'Eve: ',
+    // How many days ahead of now to scan for Mining items.
+    SCAN_DAYS: 60,
+    COLOR: 'ORANGE',
+    // Minutes-before pop-up; null = none.
+    POPUP_REMINDER_MIN: 15,
+    // Description marker used to recognise an already-mirrored source event.
+    MARKER_PREFIX: 'EVE_SRC:',
+    // Poll interval (hours) installed by installEveMiningTrigger.
+    POLL_EVERY_HOURS: 1
+  },
+
 
   // --- LOGGING -------------------------------------------------------------
   // true  = verbose logging (recommended while setting up / troubleshooting).
@@ -1139,6 +1208,649 @@ function installWeeklyTrigger(handlerName) {
 
   log_('  Installed weekly trigger: Fridays ~5 PM -> ' + handler + '().');
   log_('=== DONE. ===');
+}
+
+
+/* ============================================================================
+ * EVE MINING MIRROR — copies "Mining" in-game calendar items (via Eve ESI) to the
+ * write-to calendar as timed events.
+ * ==========================================================================*/
+
+var ESI_BASE_ = 'https://esi.evetech.net/latest';
+var ESI_TOKEN_URL_ = 'https://login.eveonline.com/v2/oauth/token';
+var ESI_AUTH_URL_ = 'https://login.eveonline.com/v2/oauth/authorize';
+var ESI_SCOPE_ = 'esi-calendar.read_calendar_events.v1';
+// Must exactly match the Callback URL registered on the Eve developer app.
+var ESI_REDIRECT_URI_ = 'https://localhost/callback';
+var ESI_TOKEN_CACHE_KEY_ = 'ESI_ACCESS_TOKEN';
+
+
+/**
+ * ONE-TIME SETUP. Stores the Eve developer app's client id/secret in Script
+ * Properties. Fill in, run once, then blank the values back out and save.
+ * Leave a value as '' to leave that property unchanged.
+ *
+ * Create the app at https://developers.eveonline.com/ (Applications > Create):
+ * scope esi-calendar.read_calendar_events.v1, callback URL
+ * https://localhost/callback.
+ */
+function esiSetupProperties() {
+  log_('esiSetupProperties start');
+  var values = {};
+  // ---- FILL THESE IN, RUN ONCE, THEN BLANK THEM OUT -----------------------
+  values[ESI_PROP_KEYS.CLIENT_ID] = '';
+  values[ESI_PROP_KEYS.CLIENT_SECRET] = '';
+  // -------------------------------------------------------------------------
+  var props = PropertiesService.getScriptProperties();
+  var wrote = 0;
+  for (var key in values) {
+    if (values[key] !== '') {
+      props.setProperty(key, String(values[key]).trim());
+      wrote++;
+      log_('  Set ' + key + ' (value not logged).');
+    }
+  }
+  log_('esiSetupProperties end: wrote ' + wrote + ' propert(ies). '
+       + 'Client id set? ' + (getProp_(ESI_PROP_KEYS.CLIENT_ID) !== '')
+       + ', secret set? ' + (getProp_(ESI_PROP_KEYS.CLIENT_SECRET) !== '')
+       + ', refresh token set? ' + (getProp_(ESI_PROP_KEYS.REFRESH_TOKEN) !== '') + '.');
+}
+
+
+/**
+ * ONE-TIME AUTH, STEP 1. Logs the Eve SSO login URL. Open it, log in as the
+ * character that can see the corp calendar, approve, then copy the `code=`
+ * value from the (failed-to-load) https://localhost/callback?code=... address.
+ */
+function esiLogAuthUrl() {
+  log_('esiLogAuthUrl start');
+  var clientId = getProp_(ESI_PROP_KEYS.CLIENT_ID);
+  if (clientId === '') {
+    log_('ERROR: ESI_CLIENT_ID is not set. Run esiSetupProperties first. esiLogAuthUrl end (aborted).');
+    return;
+  }
+  var url = ESI_AUTH_URL_ + '?response_type=code'
+          + '&redirect_uri=' + encodeURIComponent(ESI_REDIRECT_URI_)
+          + '&client_id=' + encodeURIComponent(clientId)
+          + '&scope=' + encodeURIComponent(ESI_SCOPE_)
+          + '&state=calendar-assist';
+  log_('Open this URL in a browser and log in:');
+  log_(url);
+  log_('esiLogAuthUrl end: URL logged for client id ending "'
+       + clientId.slice(-4) + '".');
+}
+
+
+/**
+ * ONE-TIME AUTH, STEP 2. Paste the `code` from the callback address below, run
+ * once, then blank it out. Exchanges it for a long-lived refresh token stored in
+ * ESI_REFRESH_TOKEN. The code is single-use and expires in minutes.
+ */
+function esiStoreAuthCode() {
+  // ---- PASTE THE CODE HERE, RUN ONCE, THEN BLANK IT OUT --------------------
+  var code = '';
+  // -------------------------------------------------------------------------
+  log_('esiStoreAuthCode start');
+  if (code.trim() === '') {
+    log_('ERROR: paste the auth code into `code` first. esiStoreAuthCode end (aborted).');
+    return;
+  }
+  var body = esiTokenRequest_({ grant_type: 'authorization_code', code: code.trim() });
+  if (!body || !body.refresh_token) {
+    log_('ERROR: token exchange failed (see above). esiStoreAuthCode end (aborted).');
+    return;
+  }
+  PropertiesService.getScriptProperties().setProperty(ESI_PROP_KEYS.REFRESH_TOKEN, body.refresh_token);
+  CacheService.getScriptCache().put(ESI_TOKEN_CACHE_KEY_, body.access_token, 1100);
+  log_('esiStoreAuthCode end: refresh token stored, character '
+       + esiCharacterIdFromToken_(body.access_token) + '. Blank the `code` value now.');
+}
+
+
+/**
+ * POSTs to the Eve SSO token endpoint with the app's client id/secret.
+ *
+ * @param {Object} payload Form fields (grant_type + code/refresh_token).
+ * @return {Object|null} Parsed token response, or null on failure.
+ */
+function esiTokenRequest_(payload) {
+  log_('esiTokenRequest_ start: grant_type=' + payload.grant_type);
+  var id = getProp_(ESI_PROP_KEYS.CLIENT_ID);
+  var secret = getProp_(ESI_PROP_KEYS.CLIENT_SECRET);
+  if (id === '' || secret === '') {
+    log_('ERROR: ESI_CLIENT_ID / ESI_CLIENT_SECRET not set. Run esiSetupProperties. '
+         + 'esiTokenRequest_ end: null (credentials missing).');
+    return null;
+  }
+  var res = UrlFetchApp.fetch(ESI_TOKEN_URL_, {
+    method: 'post',
+    payload: payload,
+    headers: { Authorization: 'Basic ' + Utilities.base64Encode(id + ':' + secret) },
+    muteHttpExceptions: true
+  });
+  var status = res.getResponseCode();
+  if (status !== 200) {
+    log_('ERROR: SSO token request (' + payload.grant_type + ') returned HTTP '
+         + status + ': ' + res.getContentText().substring(0, 300)
+         + '. esiTokenRequest_ end: null.');
+    return null;
+  }
+  var body = JSON.parse(res.getContentText());
+  log_('esiTokenRequest_ end: OK, expires_in=' + body.expires_in
+       + ', refresh token returned? ' + !!body.refresh_token);
+  return body;
+}
+
+
+/**
+ * Returns a valid ESI access token, using the cached one (~19 min life) when
+ * present, else refreshing with the stored refresh token. If SSO rotates the
+ * refresh token, the new one is stored. A cached token that ESI rejects (401)
+ * is dropped by esiGet_, so the next call refreshes.
+ *
+ * @return {string|null} Access token, or null if unavailable.
+ */
+function esiGetAccessToken_() {
+  log_('esiGetAccessToken_ start');
+  var cached = CacheService.getScriptCache().get(ESI_TOKEN_CACHE_KEY_);
+  if (cached) {
+    log_('esiGetAccessToken_ end: cache hit.');
+    return cached;
+  }
+  var refresh = getProp_(ESI_PROP_KEYS.REFRESH_TOKEN);
+  if (refresh === '') {
+    log_('ERROR: ESI_REFRESH_TOKEN not set. Run esiLogAuthUrl then esiStoreAuthCode. '
+         + 'esiGetAccessToken_ end: null.');
+    return null;
+  }
+  log_('  cache miss, refreshing.');
+  var body = esiTokenRequest_({ grant_type: 'refresh_token', refresh_token: refresh });
+  if (!body || !body.access_token) {
+    log_('esiGetAccessToken_ end: null (refresh failed).');
+    return null;
+  }
+  if (body.refresh_token && body.refresh_token !== refresh) {
+    PropertiesService.getScriptProperties().setProperty(ESI_PROP_KEYS.REFRESH_TOKEN, body.refresh_token);
+    log_('  refresh token rotated and stored.');
+  }
+  CacheService.getScriptCache().put(ESI_TOKEN_CACHE_KEY_, body.access_token, 1100);
+  log_('esiGetAccessToken_ end: refreshed and cached.');
+  return body.access_token;
+}
+
+
+/**
+ * Reads the character id from an ESI access token (a JWT whose `sub` is
+ * "CHARACTER:EVE:<id>").
+ *
+ * @param {string} token
+ * @return {string} Character id, or '' if unparsable.
+ */
+function esiCharacterIdFromToken_(token) {
+  log_('esiCharacterIdFromToken_ start');
+  try {
+    var payload = token.split('.')[1];
+    var json = Utilities.newBlob(Utilities.base64DecodeWebSafe(payload)).getDataAsString();
+    var sub = JSON.parse(json).sub || '';
+    var id = sub.split(':')[2] || '';
+    log_('esiCharacterIdFromToken_ end: ' + (id === '' ? '(empty, sub="' + sub + '")' : id));
+    return id;
+  } catch (err) {
+    log_('ERROR: could not read character id from token: ' + err
+         + '. esiCharacterIdFromToken_ end: (empty).');
+    return '';
+  }
+}
+
+
+/**
+ * GETs an ESI path with the bearer token and parses the JSON. Retries up to 3
+ * attempts on 420/429/5xx (ESI rate/error limits) with a growing pause. A 401
+ * drops the cached access token so the next run refreshes it.
+ *
+ * @param {string} path  e.g. '/characters/123/calendar/'.
+ * @param {string} token
+ * @return {*|null} Parsed JSON, or null on failure.
+ */
+function esiGet_(path, token) {
+  log_('esiGet_ start: ' + path);
+  var maxAttempts = 3;
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+    var res = UrlFetchApp.fetch(ESI_BASE_ + path, {
+      headers: { Authorization: 'Bearer ' + token },
+      muteHttpExceptions: true
+    });
+    var status = res.getResponseCode();
+    if (status === 200) {
+      log_('esiGet_ end: HTTP 200 (attempt ' + attempt + ').');
+      return JSON.parse(res.getContentText());
+    }
+    if (status === 401) {
+      CacheService.getScriptCache().remove(ESI_TOKEN_CACHE_KEY_);
+      log_('ERROR: ESI GET ' + path + ' returned 401; cleared the cached access token. '
+           + 'esiGet_ end: null.');
+      return null;
+    }
+    if ((status === 420 || status === 429 || status >= 500) && attempt < maxAttempts) {
+      var waitMs = 2000 * attempt;
+      log_('  HTTP ' + status + ' on attempt ' + attempt + '; retrying in ' + waitMs + ' ms.');
+      Utilities.sleep(waitMs);
+      continue;
+    }
+    log_('ERROR: ESI GET ' + path + ' returned HTTP ' + status + ' (attempt ' + attempt + '): '
+         + res.getContentText().substring(0, 300) + '. esiGet_ end: null.');
+    return null;
+  }
+  return null;
+}
+
+
+/**
+ * Returns the detail (title, duration, owner_type, text) for a calendar item,
+ * cached per event id for CONFIG.EVE_MINING.DETAIL_CACHE_SEC so the hourly poll
+ * does not re-fetch every Mining item. A cache entry is only trusted while the
+ * list summary's date AND title still match what was cached; if either changed,
+ * the detail is re-fetched.
+ *
+ * @param {string} charId
+ * @param {Object} summary  One entry from the ESI calendar list.
+ * @param {string} token
+ * @return {Object|null} {title, text, duration, owner_type}, or null on failure.
+ */
+function esiGetEventDetail_(charId, summary, token) {
+  var cfg = CONFIG.EVE_MINING;
+  var key = 'ESI_EVT_' + summary.event_id;
+  var cache = CacheService.getScriptCache();
+  var hit = cache.get(key);
+  if (hit) {
+    var c = JSON.parse(hit);
+    if (c.event_date === summary.event_date && c.title === summary.title) {
+      log_('  detail cache hit: event ' + summary.event_id);
+      return c.detail;
+    }
+    log_('  detail cache stale (date/title changed): event ' + summary.event_id);
+  }
+  var d = esiGet_('/characters/' + charId + '/calendar/' + summary.event_id + '/', token);
+  if (d === null) { return null; }
+  var detail = {
+    title: d.title || summary.title,
+    text: (d.text || '').substring(0, 2000),
+    duration: d.duration,
+    owner_type: d.owner_type
+  };
+  cache.put(key, JSON.stringify({
+    event_date: summary.event_date, title: summary.title, detail: detail
+  }), cfg.DETAIL_CACHE_SEC);
+  return detail;
+}
+
+
+/**
+ * Fetches upcoming in-game calendar items that match the Mining title pattern and
+ * owner types, as normalized objects.
+ *
+ * ESI lists up to 50 summaries per page; later pages are requested with
+ * from_event=<last event id>. Items are NOT assumed to be date-ordered: every
+ * page is read (up to CONFIG.EVE_MINING.MAX_PAGES) and out-of-window items are
+ * skipped individually. Repeated ids across pages are ignored.
+ *
+ * @param {string} token
+ * @param {Date}   windowEnd Items dated after this are ignored.
+ * @return {{items:Object[], complete:boolean}|null} items = [{id, title, start,
+ *         end, text}]. complete=false when MAX_PAGES cut the scan short (so
+ *         absence of an item proves nothing). null on ESI failure.
+ */
+function fetchEveMiningItems_(token, windowEnd) {
+  var cfg = CONFIG.EVE_MINING;
+  var charId = esiCharacterIdFromToken_(token);
+  log_('fetchEveMiningItems_ start: character=' + charId + ', windowEnd=' + windowEnd
+       + ', maxPages=' + cfg.MAX_PAGES);
+  if (charId === '') {
+    log_('fetchEveMiningItems_ end: null (no character id).');
+    return null;
+  }
+
+  var items = [];
+  var seen = {};
+  var fromEvent = null;
+  var listed = 0, titleMatches = 0, outOfWindow = 0, wrongOwner = 0;
+  var exhausted = false;
+
+  for (var page = 0; page < cfg.MAX_PAGES; page++) {
+    var path = '/characters/' + charId + '/calendar/' + (fromEvent ? '?from_event=' + fromEvent : '');
+    var list = esiGet_(path, token);
+    if (list === null) {
+      log_('fetchEveMiningItems_ end: null (list request failed on page ' + (page + 1) + ').');
+      return null;
+    }
+    log_('  page ' + (page + 1) + ': ' + list.length + ' event summar(ies).');
+
+    var fresh = 0;
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+      if (seen[s.event_id]) { continue; }
+      seen[s.event_id] = true;
+      fresh++;
+      listed++;
+
+      var date = new Date(s.event_date);
+      if (date.getTime() > windowEnd.getTime()) {
+        log_('  SKIP (after window): "' + s.title + '" ' + s.event_date);
+        outOfWindow++;
+        continue;
+      }
+      if (!cfg.TITLE_PATTERN.test(s.title || '')) {
+        log_('  SKIP (no "mining" match): "' + s.title + '" ' + s.event_date);
+        continue;
+      }
+      titleMatches++;
+
+      var d = esiGetEventDetail_(charId, s, token);
+      if (d === null) {
+        log_('fetchEveMiningItems_ end: null (detail failed for event ' + s.event_id + ').');
+        return null;
+      }
+      if (cfg.OWNER_TYPES.indexOf(d.owner_type) === -1) {
+        log_('  SKIP (owner_type "' + d.owner_type + '" not in ' + JSON.stringify(cfg.OWNER_TYPES)
+             + '): "' + s.title + '" ' + s.event_date);
+        wrongOwner++;
+        continue;
+      }
+      var hasDuration = (typeof d.duration === 'number' && d.duration > 0);
+      var durationMin = hasDuration ? d.duration : cfg.DEFAULT_DURATION_MIN;
+      if (!hasDuration) {
+        log_('  NOTE: no usable duration (' + JSON.stringify(d.duration) + ') for "' + s.title
+             + '"; using default ' + cfg.DEFAULT_DURATION_MIN + ' min.');
+      }
+      var item = {
+        id: String(s.event_id),
+        title: d.title,
+        start: date,
+        end: addMinutes_(date, durationMin),
+        text: d.text
+      };
+      items.push(item);
+      log_('  ACCEPT: id=' + item.id + ' "' + item.title + '" ' + fmtRange_(item.start, item.end)
+           + ' (' + durationMin + ' min)');
+    }
+
+    // A short page, an empty page, or a page with nothing new means the list ended.
+    if (list.length < 50 || fresh === 0) { exhausted = true; break; }
+    fromEvent = list[list.length - 1].event_id;
+  }
+
+  if (!exhausted) {
+    log_('WARNING: hit MAX_PAGES (' + cfg.MAX_PAGES + ') with more pages available; '
+         + 'later items were NOT read. Raise CONFIG.EVE_MINING.MAX_PAGES if needed.');
+  }
+  log_('fetchEveMiningItems_ end: listed ' + listed + ', title matches ' + titleMatches
+       + ', after window ' + outOfWindow + ', wrong owner ' + wrongOwner
+       + ', accepted ' + items.length + ', complete=' + exhausted + '.');
+  return { items: items, complete: exhausted };
+}
+
+
+/**
+ * ENTRY POINT (trigger-safe, zero-arg). Keeps the write-to calendar's Eve
+ * mirrors in step with the in-game calendar:
+ *   - new Mining item                  -> mirror created (in-game start + duration)
+ *   - mirrored item moved/re-timed     -> existing mirror re-timed (no duplicate)
+ *   - mirror deleted by hand           -> NOT recreated (id remembered in
+ *                                         ESI_MIRRORED_IDS)
+ *   - item gone from the in-game list  -> its future mirror is deleted, but only
+ *                                         when the ESI read was complete
+ * Mirrors are found by the "EVE_SRC:<event id>" first line of their description.
+ * Throws when ESI auth is unavailable so the run shows as FAILED (Apps Script
+ * failure notifications then email you) instead of failing silently every hour.
+ */
+function syncEveMiningEvents() {
+  var cfg = CONFIG.EVE_MINING;
+  log_('syncEveMiningEvents start');
+
+  var writeCal = resolveCalendar_(getProp_(PROP_KEYS.WRITE_TO_CALENDAR_ID),
+                                  getProp_(PROP_KEYS.WRITE_TO_CALENDAR_NAME),
+                                  true, 'WRITE_TO');
+  if (!writeCal) {
+    log_('ERROR: Could not resolve the WRITE-TO calendar. syncEveMiningEvents end (aborted).');
+    return;
+  }
+
+  var token = esiGetAccessToken_();
+  if (!token) {
+    log_('syncEveMiningEvents end (aborted: no ESI access token).');
+    throw new Error('syncEveMiningEvents: no ESI access token. Re-run esiLogAuthUrl / '
+                    + 'esiStoreAuthCode if the refresh token was revoked.');
+  }
+
+  var now = new Date();
+  var windowEnd = addDays_(now, cfg.SCAN_DAYS);
+  log_('  write-to "' + writeCal.getName() + '", window ' + now + '  ->  ' + windowEnd);
+
+  var fetched = fetchEveMiningItems_(token, windowEnd);
+  if (fetched === null) {
+    log_('syncEveMiningEvents end (aborted: ESI read failed).');
+    throw new Error('syncEveMiningEvents: ESI calendar read failed (see log above).');
+  }
+  var items = fetched.items;
+
+  var mirrors = indexEveMirrors_(writeCal, addDays_(now, -1), addDays_(windowEnd, 1));
+  var mirroredIds = loadMirroredIds_();
+  var tolMs = CONFIG.TIME_MATCH_TOLERANCE_MIN * 60 * 1000;
+
+  var created = 0, updated = 0, unchanged = 0, skippedDeleted = 0, failed = 0, removed = 0;
+  var currentIds = {};
+
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    currentIds[item.id] = true;
+    var mirror = mirrors[item.id];
+
+    if (mirror) {
+      var startOff = Math.abs(mirror.getStartTime().getTime() - item.start.getTime());
+      var endOff = Math.abs(mirror.getEndTime().getTime() - item.end.getTime());
+      if (startOff <= tolMs && endOff <= tolMs) {
+        log_('  SKIP (already mirrored, times match): "' + item.title + '"  '
+             + fmtRange_(item.start, item.end));
+        unchanged++;
+      } else {
+        log_('  UPDATING mirror (in-game time changed): "' + item.title + '"  was '
+             + fmtRange_(mirror.getStartTime(), mirror.getEndTime())
+             + '  now ' + fmtRange_(item.start, item.end));
+        try {
+          mirror.setTime(item.start, item.end);
+          updated++;
+        } catch (err) {
+          log_('  ERROR updating mirror for "' + item.title + '": ' + err);
+          failed++;
+        }
+      }
+      mirroredIds[item.id] = true;
+      continue;
+    }
+
+    if (mirroredIds[item.id]) {
+      log_('  SKIP (mirrored before, no mirror found — assumed deleted by hand, not recreating): "'
+           + item.title + '"  id=' + item.id);
+      skippedDeleted++;
+      continue;
+    }
+
+    if (createEveMirror_(writeCal, item, cfg.MARKER_PREFIX + item.id)) {
+      mirroredIds[item.id] = true;
+      created++;
+    } else {
+      failed++;
+    }
+  }
+
+  // Item no longer in the in-game list -> drop its future mirror. Only trusted
+  // when the read was complete; in-progress/past mirrors are never touched.
+  if (fetched.complete) {
+    for (var id in mirrors) {
+      if (currentIds[id]) { continue; }
+      var stale = mirrors[id];
+      if (stale.getStartTime().getTime() <= now.getTime()) {
+        log_('  KEEP (no longer listed but already started/past): "' + stale.getTitle() + '"');
+        continue;
+      }
+      try {
+        log_('  DELETING mirror (item gone from in-game list): "' + stale.getTitle() + '"  '
+             + fmtRange_(stale.getStartTime(), stale.getEndTime()));
+        stale.deleteEvent();
+        removed++;
+      } catch (err) {
+        log_('  ERROR deleting stale mirror "' + stale.getTitle() + '": ' + err);
+        failed++;
+      }
+    }
+  } else {
+    log_('  Skipping gone-item cleanup: ESI read was incomplete (MAX_PAGES).');
+  }
+
+  saveMirroredIds_(mirroredIds, currentIds, fetched.complete);
+
+  log_('syncEveMiningEvents end: ' + items.length + ' Mining item(s): created ' + created
+       + ', re-timed ' + updated + ', unchanged ' + unchanged + ', hand-deleted (not recreated) '
+       + skippedDeleted + ', removed ' + removed + ', FAILED ' + failed + '.');
+}
+
+
+/**
+ * Maps eve event id -> mirror CalendarEvent for every event in the window whose
+ * description's first line is "EVE_SRC:<id>".
+ *
+ * @param {Calendar} writeCal
+ * @param {Date}     from
+ * @param {Date}     to
+ * @return {Object} {id: CalendarEvent}. Duplicates of one id keep the first.
+ */
+function indexEveMirrors_(writeCal, from, to) {
+  var prefix = CONFIG.EVE_MINING.MARKER_PREFIX;
+  log_('indexEveMirrors_ start: ' + from + '  ->  ' + to);
+  var events = writeCal.getEvents(from, to);
+  var byId = {};
+  var found = 0;
+  for (var i = 0; i < events.length; i++) {
+    var first = events[i].getDescription().split('\n')[0];
+    if (first.indexOf(prefix) !== 0) { continue; }
+    var id = first.substring(prefix.length).trim();
+    found++;
+    if (byId[id]) {
+      log_('  WARNING: duplicate mirror for id ' + id + ' ("' + events[i].getTitle() + '"); keeping the first.');
+      continue;
+    }
+    byId[id] = events[i];
+  }
+  log_('indexEveMirrors_ end: scanned ' + events.length + ' event(s), ' + found
+       + ' mirror(s), ' + Object.keys(byId).length + ' distinct id(s).');
+  return byId;
+}
+
+
+/**
+ * Loads the set of Eve event ids ever mirrored (JSON array in ESI_MIRRORED_IDS).
+ * Missing/unparsable -> empty set, which at worst re-creates a hand-deleted
+ * mirror once; it never blocks a new one.
+ *
+ * @return {Object} {id: true}
+ */
+function loadMirroredIds_() {
+  var raw = getProp_(ESI_PROP_KEYS.MIRRORED_IDS);
+  var set = {};
+  if (raw === '') {
+    log_('loadMirroredIds_: none stored.');
+    return set;
+  }
+  try {
+    var arr = JSON.parse(raw);
+    for (var i = 0; i < arr.length; i++) { set[String(arr[i])] = true; }
+    log_('loadMirroredIds_: ' + arr.length + ' id(s).');
+  } catch (err) {
+    log_('WARNING: ESI_MIRRORED_IDS unparsable (' + err + '); treating as empty.');
+  }
+  return set;
+}
+
+
+/**
+ * Stores the mirrored-id set. When the ESI read was complete, ids no longer in
+ * the in-game list are pruned so the property stays small; when incomplete,
+ * nothing is pruned.
+ *
+ * @param {Object}  ids       {id: true} to store.
+ * @param {Object}  currentIds ids present in this run's item list.
+ * @param {boolean} complete  Whether the ESI read covered the whole list.
+ */
+function saveMirroredIds_(ids, currentIds, complete) {
+  var keep = [];
+  for (var id in ids) {
+    if (!complete || currentIds[id]) { keep.push(id); }
+  }
+  PropertiesService.getScriptProperties().setProperty(ESI_PROP_KEYS.MIRRORED_IDS, JSON.stringify(keep));
+  log_('saveMirroredIds_: stored ' + keep.length + ' id(s) (pruned ' + (Object.keys(ids).length - keep.length) + ').');
+}
+
+
+/**
+ * Creates the mirror event (in-game start/duration) with color and reminder
+ * from CONFIG.EVE_MINING. The description's FIRST line is the EVE_SRC marker.
+ *
+ * @param {Calendar} writeCal
+ * @param {Object}   item
+ * @param {string}   marker
+ * @return {boolean} true if created.
+ */
+function createEveMirror_(writeCal, item, marker) {
+  var cfg = CONFIG.EVE_MINING;
+  var title = cfg.EVENT_TITLE_PREFIX + item.title;
+  log_('createEveMirror_ start: "' + title + '"  ' + fmtRange_(item.start, item.end)
+       + '  marker=' + marker);
+  try {
+    var description = marker + '\nMirrored from Eve in-game calendar: ' + item.title;
+    if (item.text) { description += '\n\n' + item.text; }
+
+    var ev = writeCal.createEvent(title, item.start, item.end, { description: description });
+
+    if (cfg.COLOR && CalendarApp.EventColor[cfg.COLOR]) {
+      ev.setColor(CalendarApp.EventColor[cfg.COLOR]);
+    } else if (cfg.COLOR) {
+      log_('  WARNING: EVE_MINING.COLOR "' + cfg.COLOR + '" is not a valid EventColor; leaving default.');
+    }
+    if (cfg.POPUP_REMINDER_MIN !== null && cfg.POPUP_REMINDER_MIN !== undefined) {
+      ev.addPopupReminder(cfg.POPUP_REMINDER_MIN);
+    }
+    log_('createEveMirror_ end: CREATED (color=' + cfg.COLOR + ', reminder='
+         + cfg.POPUP_REMINDER_MIN + ')');
+    return true;
+  } catch (err) {
+    log_('createEveMirror_ end: ERROR creating "' + title + '": ' + err);
+    return false;
+  }
+}
+
+
+/**
+ * OPTIONAL AUTOMATION. Installs an hourly time trigger for syncEveMiningEvents
+ * (ESI has no push notifications). Re-running replaces the old trigger, never
+ * stacks.
+ */
+function installEveMiningTrigger() {
+  log_('installEveMiningTrigger start');
+  var triggers = ScriptApp.getProjectTriggers();
+  var removed = 0;
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'syncEveMiningEvents') {
+      ScriptApp.deleteTrigger(triggers[i]);
+      removed++;
+    }
+  }
+  log_('  Removed ' + removed + ' existing syncEveMiningEvents trigger(s).');
+
+  ScriptApp.newTrigger('syncEveMiningEvents')
+    .timeBased()
+    .everyHours(CONFIG.EVE_MINING.POLL_EVERY_HOURS)
+    .create();
+  log_('installEveMiningTrigger end: polling every ' + CONFIG.EVE_MINING.POLL_EVERY_HOURS + 'h.');
 }
 
 
