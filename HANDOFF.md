@@ -1,45 +1,95 @@
 # Handoff
 
-## Current state (2026-08-07)
+## v3.5 (2026-09-25) — Eve "Mining" mirror
 
-`CalendarAssistScheduler.gs` is at **v3.3**, pushed to the live Apps Script
-project via `clasp push --force`, and merged to `main` via a PR from branch
-`fix/scheduler-auto-replace-conflicts`.
+Added `syncEveMiningEvents` / `installEveMiningTrigger` (+ `fetchEveMiningItems_`,
+`indexEveMirrors_`, `createEveMirror_`, `esiGetEventDetail_`, ESI helpers `esi*`,
+`CONFIG.EVE_MINING`, `ESI_PROP_KEYS`). The in-game Eve calendar has no Google feed, so it is read
+from Eve ESI (`esi-calendar.read_calendar_events.v1`) with a refresh token in Script Properties
+(`ESI_CLIENT_ID`, `ESI_CLIENT_SECRET`, `ESI_REFRESH_TOKEN`, `ESI_MIRRORED_IDS`; kept out of
+`PROP_KEYS` so `clearCalendarProperties` can't wipe them). Items with "Mining" in the title and
+owner_type in `CONFIG.EVE_MINING.OWNER_TYPES` (default corporation) become timed events on the
+write-to calendar (`Eve: <title>`, start = in-game date, end = start + ESI duration). A Google Task
+was requested but Tasks store only a date, so a timed calendar event is used.
 
-The v3.3 diff bundled two separate pieces of work from this session:
+Sync behaviour (after review fixes): mirrors are found by an `EVE_SRC:<event_id>` FIRST description
+line. New item -> created. Re-timed in-game item -> its mirror is re-timed (no duplicate). Mirror
+deleted by hand -> NOT recreated (id kept in `ESI_MIRRORED_IDS`; delete that property to reset).
+Item gone from the in-game list -> its future mirror is deleted, only when the ESI read was
+complete (not cut by `MAX_PAGES`); started/past mirrors are never deleted. Auth failure THROWS so
+the trigger run shows as failed — turn on failure notifications for the trigger or it fails
+unseen. Item detail is cached 6 h per event id (re-fetched if date/title change), so a body/
+duration-only edit can take up to 6 h to show. Poll is hourly (ESI has no push). A 401 clears the
+cached access token.
 
-1. **`diagnoseReadFromCalendar()`** (new function) — a diagnostic for stale
-   read-from-calendar symptoms (log shows old shift titles/times). Dumps
-   calendar-name match count, resolved calendar ID, and per-event
-   `getLastUpdated()` so a stale ICS-subscription copy can be told apart from
-   a genuinely wrong pattern match.
+Do not assume ESI list order: pages are read up to `MAX_PAGES` and out-of-window items skipped
+individually (early stop was removed on purpose).
 
-2. **Removed the conflict-resolution popup entirely.** The old flow tried
-   `ui.alert()` for a YES/NO confirmation before deleting wrong-time/orphan
-   events, falling back to `CONFIG.WHEN_NO_UI` (`'stop'` by default) when no
-   UI was reachable. In practice this script only ever runs from the Apps
-   Script editor or a time-based trigger — neither can show a dialog — so the
-   fallback path was the *only* path, and `'stop'` meant conflicts were
-   silently logged and never fixed.
+Verified live (2026-09-25): the ORIGINAL v3.5 build read 4 corp Mining items from ESI and created
+4 mirrors on the primary calendar (owner_type "corporation" accepted, times correct).
+NOT verified: everything added after that review — re-time/update path, gone-item deletion,
+hand-delete suppression, detail cache, 401/429 retry, the throw-on-auth-failure path, the hourly
+trigger (`installEveMiningTrigger` not confirmed run), refresh-token rotation. No test suite
+exists; only `node --check` syntax was run. The Eve `code` / client secret are blank in the repo
+and were re-pushed blank; keep the editor copy blank.
 
-   Fixed by deleting `askToReplace_`, `getUiOrNull_`, and
-   `CONFIG.WHEN_NO_UI` outright. `logConflicts_` (renamed from
-   `askToReplace_`) now just logs what's about to change, and the caller
-   proceeds straight to deleting the wrong/orphan events and recreating the
-   correct set — no confirmation step, no config knob.
+## Current state (2026-09-14)
+
+`CalendarAssistScheduler.gs` is at **v3.4**, pushed to the live Apps Script project via
+`clasp push --force`.
+
+This session first synced local to live (`clasp pull` showed one drift: `runForWeek(n)` had
+gained a default parameter, `n=0`, from an editor-side edit — merged in as a baseline commit),
+then fixed two real bugs and cleaned up duplication:
+
+1. **DST-unsafe week window.** `createAssistEvents`, `diagnoseReadFromCalendar`, and
+   `deleteAssistEventsInTargetWeek` all computed the window end as
+   `addMinutes_(weekStart, NUM_DAYS * 24 * 60)` — a fixed elapsed-minutes offset. On the
+   spring-forward week this landed at 23:00 Friday (dropping the last hour); on fall-back,
+   01:00 Saturday. Fixed with a new `addDays_()` helper that does calendar-date arithmetic
+   (matches how `getTargetSunday_` already builds midnight-local dates), used via a new
+   `getWeekWindow_(offset)` helper.
+
+2. **Out-of-week helper events were invisible to reconcile.** `findAssistEvents_` was scanned
+   over exactly the Sun-Fri shift window. A block anchored far enough from its shift's
+   START/END (e.g. "Prep lunch", START-75, for an early-Sunday shift) lands on *Saturday* —
+   outside that window. Reconcile then saw it as `missing` every run, and `SKIP_DUPLICATES`
+   blocked recreating it, so it could also never be cleaned up as an orphan if the shift moved.
+   Fixed: `getWeekWindow_` now also returns a `scanStart`/`scanEnd` padded by
+   `maxBlockOffsetMin_()` (the largest `|startOffsetMin|`/`|endOffsetMin|` across
+   `CONFIG.BLOCKS`, rounded up to whole days). The *shift read* window is unchanged; only the
+   *write-to reconcile scan* is padded, and `findAssistEvents_` still filters to managed
+   titles, so nothing outside the block titles is ever returned by the wider scan.
+
+3. **Cleanup:** deduped the `weekOffset` trigger-event-object guard (now `resolveWeekOffset_`)
+   and the week-window math (now `getWeekWindow_`) across the three call sites.
+   `deleteAssistEventsInTargetWeek` now reuses `deleteEvents_` (try/catch per event, doesn't
+   abort the whole run on one failure) instead of a bare `deleteEvent()` loop.
+   `validateBlocks_` now also rejects a block with an invalid `color` name or a
+   non-numeric/non-null `popupReminderMin` at validation time, before any events are written
+   (previously a bad color only warned per-event after creation, and a bad reminder value
+   silently dropped just that one event via the `createEventSafely_` catch).
 
 ## Traps for the next session
 
-- **`askToReplace_`, `getUiOrNull_`, `CONFIG.WHEN_NO_UI` no longer exist.**
-  Don't re-add a popup/confirmation step for this reconciliation flow — it's
-  a dead end in this script's actual run contexts (editor / trigger only,
-  never a bound Sheet menu).
-- The header doc comment and `buildConflictMessage_`'s trailing line were
-  updated to match (no more "Replace them? YES/NO"). If you touch the
-  reconciliation flow again, keep those two in sync with the code.
+- **`askToReplace_`, `getUiOrNull_`, `CONFIG.WHEN_NO_UI` no longer exist** (removed in v3.3).
+  Don't re-add a popup/confirmation step for the reconciliation flow — this script only runs
+  from the Apps Script editor or a time-based trigger, neither of which can show a dialog.
+- **The reconcile *scan* window is now wider than the shift *processing* window.** If you add
+  logic that reads `findAssistEvents_`'s result and assumes it is bounded by
+  `weekStart`/`weekEnd`, it isn't — it's bounded by `window.scanStart`/`window.scanEnd`. Read
+  events are still bounded by `weekStart`/`weekEnd`.
+- Two known gaps intentionally left out of this pass (flagged during review, not built):
+  - Managed events are matched by **title only** — a hand-made event on the write-to calendar
+    happening to be named e.g. "Prep lunch" is indistinguishable from one this script created,
+    and is fair game to be treated as an orphan and deleted. Adding an ownership marker (e.g. a
+    tag in the event description) would need a one-time migration for existing events.
+  - Reconcile only compares start/end times. An existing event with the correct times but the
+    wrong color or reminder is left alone — drift there is silent.
 
 ## Not yet done
 
-Nothing outstanding from this change. Next stale-calendar report should be
-diagnosed with `diagnoseReadFromCalendar()` before assuming the block math
-is wrong.
+v3.5: live-verify the Eve mirror paths listed under "NOT verified" above (run `syncEveMiningEvents`
+twice; expect `unchanged N` on the second), then run `installEveMiningTrigger`. Otherwise nothing
+outstanding. Next stale-calendar report should be diagnosed with
+`diagnoseReadFromCalendar()` before assuming the block math is wrong.
