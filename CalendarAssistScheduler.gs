@@ -1,7 +1,10 @@
 /**
  * ============================================================================
  * FILE: CalendarAssistScheduler.gs
- * Version: 3.5 | Updated: 2026-09-25
+ * Version: 3.6 | Updated: 2026-09-25
+ *   v3.6: Eve mirrors are now DURATION_MIN (15) long instead of the in-game
+ *   duration, use the calendar's default color (COLOR ''), and resetEveMirrors()
+ *   was added to re-create existing ones with the new color.
  *   v3.5: adds the Eve "Mining" mirror. Deviations from the request: a timed
  *   calendar event instead of a Google Task (Tasks drop the time), read via Eve
  *   ESI polled hourly instead of a Google calendar-updated trigger (the in-game
@@ -71,8 +74,10 @@
  *   esiStoreAuthCode              - swap the pasted auth code for a refresh token.
  *   syncEveMiningEvents           - mirror upcoming Eve in-game calendar items whose
  *                                   title contains "Mining" onto the write-to calendar
- *                                   as timed events (same start/end as in game).
+ *                                   as timed events (in-game start, DURATION_MIN long).
  *   installEveMiningTrigger       - run syncEveMiningEvents on an hourly poll.
+ *   resetEveMirrors               - delete future Eve mirrors + forget them, so the
+ *                                   next sync re-creates them (e.g. after a color change).
  *
  * EVE MINING MIRROR (v3.5):
  *   The in-game calendar has no Google feed, so the script reads it from Eve's ESI
@@ -237,8 +242,9 @@ var CONFIG = {
     // ESI owner_type values to accept. 'corporation' = corp calendar items only.
     // Add 'alliance', 'character', etc. to widen. Rejected types are logged.
     OWNER_TYPES: ['corporation'],
-    // Duration (min) used if ESI returns no duration for an item.
-    DEFAULT_DURATION_MIN: 60,
+    // Length (min) of every mirrored event, starting at the in-game time. The
+    // in-game duration is ignored.
+    DURATION_MIN: 15,
     // Max ESI list pages (50 events each) fetched per run.
     MAX_PAGES: 10,
     // Seconds an item's ESI detail (duration/owner/text) is cached, so the
@@ -249,7 +255,9 @@ var CONFIG = {
     EVENT_TITLE_PREFIX: 'Eve: ',
     // How many days ahead of now to scan for Mining items.
     SCAN_DAYS: 60,
-    COLOR: 'ORANGE',
+    // '' = the calendar's own default color (the "same green" as the rest of the
+    // calendar). Set an EventColor name (e.g. 'GREEN', 'PALE_GREEN') to force one.
+    COLOR: '',
     // Minutes-before pop-up; null = none.
     POPUP_REMINDER_MIN: 15,
     // Description marker used to recognise an already-mirrored source event.
@@ -1556,12 +1564,9 @@ function fetchEveMiningItems_(token, windowEnd) {
         wrongOwner++;
         continue;
       }
-      var hasDuration = (typeof d.duration === 'number' && d.duration > 0);
-      var durationMin = hasDuration ? d.duration : cfg.DEFAULT_DURATION_MIN;
-      if (!hasDuration) {
-        log_('  NOTE: no usable duration (' + JSON.stringify(d.duration) + ') for "' + s.title
-             + '"; using default ' + cfg.DEFAULT_DURATION_MIN + ' min.');
-      }
+      // Mirror length is fixed by config; the in-game duration (d.duration) is
+      // deliberately ignored so every mirror is a short reminder block.
+      var durationMin = cfg.DURATION_MIN;
       var item = {
         id: String(s.event_id),
         title: d.title,
@@ -1593,7 +1598,7 @@ function fetchEveMiningItems_(token, windowEnd) {
 /**
  * ENTRY POINT (trigger-safe, zero-arg). Keeps the write-to calendar's Eve
  * mirrors in step with the in-game calendar:
- *   - new Mining item                  -> mirror created (in-game start + duration)
+ *   - new Mining item                  -> mirror created (in-game start + DURATION_MIN)
  *   - mirrored item moved/re-timed     -> existing mirror re-timed (no duplicate)
  *   - mirror deleted by hand           -> NOT recreated (id remembered in
  *                                         ESI_MIRRORED_IDS)
@@ -1792,7 +1797,7 @@ function saveMirroredIds_(ids, currentIds, complete) {
 
 
 /**
- * Creates the mirror event (in-game start/duration) with color and reminder
+ * Creates the mirror event (in-game start, DURATION_MIN long) with color and reminder
  * from CONFIG.EVE_MINING. The description's FIRST line is the EVE_SRC marker.
  *
  * @param {Calendar} writeCal
@@ -1819,13 +1824,55 @@ function createEveMirror_(writeCal, item, marker) {
     if (cfg.POPUP_REMINDER_MIN !== null && cfg.POPUP_REMINDER_MIN !== undefined) {
       ev.addPopupReminder(cfg.POPUP_REMINDER_MIN);
     }
-    log_('createEveMirror_ end: CREATED (color=' + cfg.COLOR + ', reminder='
+    log_('createEveMirror_ end: CREATED (color=' + (cfg.COLOR ? cfg.COLOR : 'calendar default') + ', reminder='
          + cfg.POPUP_REMINDER_MIN + ')');
     return true;
   } catch (err) {
     log_('createEveMirror_ end: ERROR creating "' + title + '": ' + err);
     return false;
   }
+}
+
+
+/**
+ * ONE-OFF RESET. Deletes every FUTURE Eve mirror in the scan window and clears
+ * ESI_MIRRORED_IDS, so the next syncEveMiningEvents recreates them fresh. Use it
+ * after changing CONFIG.EVE_MINING.COLOR: the API cannot reset an existing
+ * event back to the calendar's default color, so re-created events are the way
+ * to apply it. (A changed DURATION_MIN needs no reset — sync re-times mirrors.)
+ * Only events whose description starts with the EVE_SRC marker are touched.
+ */
+function resetEveMirrors() {
+  log_('resetEveMirrors start (scan window now + ' + (CONFIG.EVE_MINING.SCAN_DAYS + 1) + ' day(s))');
+  var writeCal = resolveCalendar_(getProp_(PROP_KEYS.WRITE_TO_CALENDAR_ID),
+                                  getProp_(PROP_KEYS.WRITE_TO_CALENDAR_NAME),
+                                  true, 'WRITE_TO');
+  if (!writeCal) {
+    log_('ERROR: Could not resolve the WRITE-TO calendar. resetEveMirrors end (aborted).');
+    return;
+  }
+  var now = new Date();
+  var mirrors = indexEveMirrors_(writeCal, now, addDays_(now, CONFIG.EVE_MINING.SCAN_DAYS + 1));
+  log_('  found ' + Object.keys(mirrors).length + ' mirror(s) in the window.');
+  var deleted = 0, failed = 0;
+  for (var id in mirrors) {
+    var ev = mirrors[id];
+    if (ev.getStartTime().getTime() <= now.getTime()) {
+      log_('  KEEP (already started): "' + ev.getTitle() + '"  ' + fmtRange_(ev.getStartTime(), ev.getEndTime()));
+      continue;
+    }
+    try {
+      log_('  DELETING mirror: "' + ev.getTitle() + '"  ' + fmtRange_(ev.getStartTime(), ev.getEndTime()));
+      ev.deleteEvent();
+      deleted++;
+    } catch (err) {
+      log_('  ERROR deleting mirror "' + ev.getTitle() + '": ' + err);
+      failed++;
+    }
+  }
+  PropertiesService.getScriptProperties().deleteProperty(ESI_PROP_KEYS.MIRRORED_IDS);
+  log_('resetEveMirrors end: deleted ' + deleted + ', failed ' + failed
+       + ', cleared ESI_MIRRORED_IDS. Run syncEveMiningEvents next.');
 }
 
 
