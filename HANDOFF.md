@@ -1,6 +1,15 @@
 # Handoff
 
-## v3.5 (2026-09-25) — Eve "Mining" mirror
+## v3.6 (2026-09-25) — Eve mirror: 15 min, default color
+
+Mirrors are now `CONFIG.EVE_MINING.DURATION_MIN` (15) long — the in-game duration is ignored — and
+`COLOR: ''` uses the calendar's default color (assumed to be the green the user means; if wrong,
+set `COLOR` to `'GREEN'`/`'PALE_GREEN'` and run `resetEveMirrors`). Existing mirrors re-time to 15 min
+on the next sync, but the API cannot reset an event to the default color, so `resetEveMirrors()`
+(new) deletes future mirrors + clears `ESI_MIRRORED_IDS` and the next sync recreates them.
+Not verified live: the reset + recreate, and that the default color is the intended green.
+
+## v3.5 (2026-09-25) — Eve "Mining" mirror (start = in-game date; length since changed, see v3.6)
 
 Added `syncEveMiningEvents` / `installEveMiningTrigger` (+ `fetchEveMiningItems_`,
 `indexEveMirrors_`, `createEveMirror_`, `esiGetEventDetail_`, ESI helpers `esi*`,
@@ -9,7 +18,7 @@ from Eve ESI (`esi-calendar.read_calendar_events.v1`) with a refresh token in Sc
 (`ESI_CLIENT_ID`, `ESI_CLIENT_SECRET`, `ESI_REFRESH_TOKEN`, `ESI_MIRRORED_IDS`; kept out of
 `PROP_KEYS` so `clearCalendarProperties` can't wipe them). Items with "Mining" in the title and
 owner_type in `CONFIG.EVE_MINING.OWNER_TYPES` (default corporation) become timed events on the
-write-to calendar (`Eve: <title>`, start = in-game date, end = start + ESI duration). A Google Task
+write-to calendar (`Eve: <title>`, start = in-game date, end = start + `DURATION_MIN`, originally the ESI duration). A Google Task
 was requested but Tasks store only a date, so a timed calendar event is used.
 
 Sync behaviour (after review fixes): mirrors are found by an `EVE_SRC:<event_id>` FIRST description
@@ -18,8 +27,8 @@ deleted by hand -> NOT recreated (id kept in `ESI_MIRRORED_IDS`; delete that pro
 Item gone from the in-game list -> its future mirror is deleted, only when the ESI read was
 complete (not cut by `MAX_PAGES`); started/past mirrors are never deleted. Auth failure THROWS so
 the trigger run shows as failed — turn on failure notifications for the trigger or it fails
-unseen. Item detail is cached 6 h per event id (re-fetched if date/title change), so a body/
-duration-only edit can take up to 6 h to show. Poll is hourly (ESI has no push). A 401 clears the
+unseen. Item detail is cached 6 h per event id (re-fetched if date/title change), so a body-
+only edit can take up to 6 h to show (duration is ignored since v3.6). Poll is hourly (ESI has no push). A 401 clears the
 cached access token.
 
 Do not assume ESI list order: pages are read up to `MAX_PAGES` and out-of-window items skipped
